@@ -1,19 +1,21 @@
-"""
-Project 1: Agentic AI / RAG-Based Natural Language MongoDB Query System
-Uses: MongoDB Atlas (sample_mflix), Google Gemini (free), Streamlit
-"""
-
 import streamlit as st
 import pymongo
-import google.generativeai as genai
+from groq import Groq
 import json
 import re
 from bson import ObjectId
 import datetime
+import pymysql
+import pandas as pd
 
-# ─── Hardcoded Credentials (replace with your actual values) ────────────────────
-MONGO_URI = "YOUR_MONGODB_ATLAS_URI_HERE"
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+# ─── Hardcoded Credentials ───────────────────────────────────────────────────────
+MONGO_URI     = "Your Mongo URI"
+GROQ_API_KEY  = "Your API Key"
+TIDB_HOST     = "gateway01.ap-southeast-1.prod.aws.tidbcloud.com"
+TIDB_PORT     = 4000
+TIDB_USER     = "TIDB User"
+TIDB_PASSWORD = "Your Pwd"
+TIDB_DATABASE = "DB name"
 
 # ─── Page Config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI MongoDB Query System", page_icon="🤖", layout="wide")
@@ -30,14 +32,14 @@ st.markdown("""
 # ─── Sidebar: Info Only ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("ℹ️ About")
-    st.markdown("**Project 1 — AI MongoDB Query System**")
+    st.markdown("**Project — AI Database Automation System**")
     st.markdown("Ask questions in plain English and the AI generates and runs the MongoDB query for you.")
     st.markdown("---")
     st.markdown("**Database:** MongoDB Atlas `sample_mflix`")
-    st.markdown("**AI Model:** Google Gemini 1.5 Flash")
+    st.markdown("**AI Model:** LLaMA 3.3 70B Versatile (via Groq API)")
 
 mongo_uri = MONGO_URI
-gemini_key = GEMINI_API_KEY
+groq_key  = GROQ_API_KEY
 
 # ─── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -57,8 +59,23 @@ def json_safe(obj):
 @st.cache_resource(show_spinner="Connecting to MongoDB…")
 def get_mongo_client(uri: str):
     client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
-    client.admin.command("ping")      # will raise if connection fails
+    client.admin.command("ping")
     return client
+
+
+@st.cache_resource(show_spinner="Connecting to TiDB…")
+def get_tidb_connection():
+    conn = pymysql.connect(
+        host=TIDB_HOST,
+        port=TIDB_PORT,
+        user=TIDB_USER,
+        password=TIDB_PASSWORD,
+        database=TIDB_DATABASE,
+        ssl={"ca": None},
+        ssl_verify_cert=False,
+        ssl_verify_identity=False
+    )
+    return conn
 
 
 def build_schema_context(client, db_name="sample_mflix"):
@@ -77,18 +94,20 @@ def build_schema_context(client, db_name="sample_mflix"):
     return "\n\n".join(context_parts)
 
 
-def ask_gemini(model, prompt: str) -> str:
-    response = model.generate_content(prompt)
-    return response.text.strip()
+def ask_groq(model, prompt: str) -> str:
+    response = model.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1000
+    )
+    return response.choices[0].message.content.strip()
 
 
 def extract_python_query(text: str) -> str:
     """Pull out the Python/PyMongo expression from the AI reply."""
-    # look for fenced code block first
     fenced = re.search(r"```(?:python)?\s*([\s\S]+?)```", text)
     if fenced:
         return fenced.group(1).strip()
-    # fall back to first line that looks like a PyMongo call
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("db.") or line.startswith("collection"):
@@ -96,40 +115,64 @@ def extract_python_query(text: str) -> str:
     return text.strip()
 
 
+def extract_sql_block(text: str) -> str:
+    """Pull out SQL from the AI reply."""
+    fenced = re.search(r"```(?:sql)?\s*([\s\S]+?)```", text)
+    if fenced:
+        return fenced.group(1).strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("CREATE") or line.upper().startswith("SELECT"):
+            return line
+    return text.strip()
+
+
 def execute_query(client, query_code: str, db_name="sample_mflix"):
-    """
-    Safely execute a generated PyMongo query.
-    Only find / aggregate / count_documents are allowed.
-    """
+    """Safely execute a generated PyMongo query. Only read operations allowed."""
     db = client[db_name]
     allowed_ops = ("find", "aggregate", "count_documents", "distinct")
     if not any(op in query_code for op in allowed_ops):
         return None, "Only read operations (find / aggregate / count_documents) are permitted."
-
-    # Provide `db` in the exec namespace so generated code can reference it
     local_ns = {"db": db}
     try:
-        exec(f"_result = {query_code}", local_ns)   # noqa: S102
+        exec(f"_result = {query_code}", local_ns)
         result = local_ns.get("_result")
         if hasattr(result, "__iter__") and not isinstance(result, (dict, str, int, float)):
-            return list(result)[:50], None           # cap at 50 rows
+            return list(result)[:50], None
         return result, None
     except Exception as exc:
         return None, str(exc)
 
 
+def flatten_doc(doc: dict, prefix="") -> dict:
+    """Flatten nested MongoDB document into a flat dict."""
+    flat = {}
+    for k, v in doc.items():
+        key = f"{prefix}_{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(flatten_doc(v, key))
+        elif isinstance(v, list):
+            flat[key] = ", ".join(str(i) for i in v[:5])
+        else:
+            flat[key] = v
+    return flat
+
+
 # ─── Initialise conversation memory ─────────────────────────────────────────────
 if "history" not in st.session_state:
-    st.session_state.history = []   # list of {"role": ..., "content": ...}
+    st.session_state.history = []
 
-# ─── Main Tab ───────────────────────────────────────────────────────────────────
-tab1, = st.tabs(["Process1"])
+# ─── Tabs ────────────────────────────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["Process1", "Process2"])
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PROCESS 1 — Natural Language MongoDB Query
+# ════════════════════════════════════════════════════════════════════════════════
 
 with tab1:
     st.title("🤖 AI-Powered MongoDB Query System")
     st.caption("Ask questions in plain English — the AI generates and runs the MongoDB query for you.")
 
-    # ── Initialise clients ───────────────────────────────────────────────────────
     try:
         client = get_mongo_client(mongo_uri)
     except Exception as e:
@@ -137,44 +180,34 @@ with tab1:
         st.stop()
 
     try:
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = Groq(api_key=GROQ_API_KEY)
     except Exception as e:
-        st.error(f"❌ Gemini initialisation failed: {e}")
+        st.error(f"❌ Groq initialisation failed: {e}")
         st.stop()
 
-    st.success("✅ Connected to MongoDB Atlas  |  Gemini ready")
+    st.success("✅ Connected to MongoDB Atlas  |  Groq ready")
 
-    # ── Build / cache RAG schema context ────────────────────────────────────────
     with st.spinner("📚 Loading schema context (RAG)…"):
         schema_ctx = build_schema_context(client)
 
-    with st.expander("📋 View RAG Schema Context"):
-        st.text(schema_ctx)
-
     st.markdown("---")
 
-    # ── Chat history display ─────────────────────────────────────────────────────
     for msg in st.session_state.history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # ── User input ───────────────────────────────────────────────────────────────
     user_prompt = st.chat_input("Ask a question about movies…  e.g. Show top 10 movies by IMDb rating")
 
     if user_prompt:
-        # Show user message
         st.session_state.history.append({"role": "user", "content": user_prompt})
         with st.chat_message("user"):
             st.markdown(user_prompt)
 
-        # ── Build conversation context for follow-up support ─────────────────────
         history_text = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
-            for m in st.session_state.history[-6:]   # last 6 turns
+            for m in st.session_state.history[-6:]
         )
 
-        # ── Ask Gemini to generate a PyMongo query ───────────────────────────────
         ai_prompt = f"""
 You are an expert MongoDB query generator.
 
@@ -201,19 +234,14 @@ db.movies.find({{}}, {{"title": 1, "imdb.rating": 1, "_id": 0}}).sort("imdb.rati
 ```
 """
         with st.spinner("🤔 Generating query…"):
-            ai_reply = ask_gemini(model, ai_prompt)
+            ai_reply = ask_groq(model, ai_prompt)
 
         query_code = extract_python_query(ai_reply)
 
-        # ── Execute the generated query ──────────────────────────────────────────
         with st.spinner("⚡ Running query on MongoDB…"):
             results, error = execute_query(client, query_code)
 
-        # ── Format assistant reply ───────────────────────────────────────────────
         with st.chat_message("assistant"):
-            st.markdown("**Generated MongoDB Query:**")
-            st.code(query_code, language="python")
-
             if error:
                 st.error(f"Query error: {error}")
                 reply_text = f"❌ Query error: {error}"
@@ -234,11 +262,183 @@ db.movies.find({{}}, {{"title": 1, "imdb.rating": 1, "_id": 0}}).sort("imdb.rati
 
         st.session_state.history.append({
             "role": "assistant",
-            "content": f"Query:\n```python\n{query_code}\n```\n\n{reply_text}"
+            "content": reply_text
         })
 
-    # ── Clear chat ───────────────────────────────────────────────────────────────
     if st.session_state.history:
         if st.button("🗑️ Clear conversation"):
             st.session_state.history = []
             st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PROCESS 2 — Agentic MongoDB → TiDB (MySQL) Data Migration
+# ════════════════════════════════════════════════════════════════════════════════
+
+with tab2:
+    st.title("🔄 Agentic MongoDB → MySQL Data Migration")
+    st.caption("Describe what data to migrate — the AI agent handles extraction, schema creation, and insertion.")
+
+    try:
+        client2 = get_mongo_client(mongo_uri)
+    except Exception as e:
+        st.error(f"❌ MongoDB connection failed: {e}")
+        st.stop()
+
+    try:
+        model2 = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        st.error(f"❌ Groq initialisation failed: {e}")
+        st.stop()
+
+    try:
+        tidb_conn = get_tidb_connection()
+    except Exception as e:
+        st.error(f"❌ TiDB connection failed: {e}")
+        st.stop()
+
+    st.success("✅ Connected to MongoDB Atlas  |  TiDB (MySQL) ready  |  Groq ready")
+
+    st.markdown("---")
+
+    migration_prompt = st.text_area(
+        "Enter migration prompt:",
+        placeholder="e.g. Extract movie title, year, genres, runtime and IMDb rating from MongoDB and store it in MySQL",
+        height=80
+    )
+
+    if st.button("▶️ Run Migration", type="primary"):
+        if not migration_prompt.strip():
+            st.warning("Please enter a migration prompt.")
+        else:
+            # ── Step 1: AI identifies collection and fields ───────────────────────
+            with st.spinner("🤖 Agent analysing prompt…"):
+                schema_ctx_p2 = build_schema_context(client2)
+                step1_prompt = f"""
+You are a data migration agent. Based on the user prompt, identify:
+1. The MongoDB collection name
+2. The list of fields to extract (use dot notation for nested fields e.g. imdb.rating)
+
+SCHEMA CONTEXT:
+{schema_ctx_p2}
+
+USER PROMPT: {migration_prompt}
+
+Respond ONLY in this JSON format with no explanation:
+{{"collection": "movies", "fields": ["title", "year", "genres", "runtime", "imdb.rating"]}}
+"""
+                step1_reply = ask_groq(model2, step1_prompt)
+                json_match = re.search(r"\{[\s\S]+\}", step1_reply)
+                if not json_match:
+                    st.error("❌ Agent could not parse collection and fields.")
+                    st.stop()
+                migration_info = json.loads(json_match.group())
+                collection_name = migration_info["collection"]
+                fields = migration_info["fields"]
+
+            # Build unique table name from collection + selected fields
+            import re as _re
+            fields_suffix = "_".join(
+                _re.sub(r"[^a-zA-Z0-9]", "", f.split(".")[-1])[:6]
+                for f in fields[:4]
+            ).lower()
+            table_name = f"{collection_name}_{fields_suffix}"[:60]
+
+            st.info(f"📦 Collection: `{collection_name}` | Fields: `{', '.join(fields)}` | Table: `{table_name}`")
+
+            # ── Step 2: Fetch data from MongoDB ──────────────────────────────────
+            with st.spinner("📥 Fetching data from MongoDB…"):
+                projection = {"_id": 0}
+                for f in fields:
+                    projection[f] = 1
+                db2 = client2["sample_mflix"]
+                raw_docs = list(db2[collection_name].find({}, projection).limit(100))
+
+            st.info(f"✅ Fetched {len(raw_docs)} documents from MongoDB")
+
+            # ── Step 3: Flatten documents ─────────────────────────────────────────
+            with st.spinner("🔧 Flattening nested fields…"):
+                flat_docs = [flatten_doc(doc) for doc in raw_docs]
+                df = pd.DataFrame(flat_docs)
+                df.columns = [re.sub(r"[^a-zA-Z0-9_]", "_", col) for col in df.columns]
+                df = df.where(pd.notnull(df), None)
+
+            # ── Step 4: AI generates MySQL CREATE TABLE ───────────────────────────
+            with st.spinner("🤖 Agent generating MySQL schema…"):
+                sample_row = df.iloc[0].to_dict() if len(df) > 0 else {}
+                step4_prompt = f"""
+You are a MySQL schema expert. Generate a CREATE TABLE statement for TiDB (MySQL compatible).
+
+Table name: {table_name}
+Columns and sample values: {json.dumps({k: str(v)[:50] for k, v in sample_row.items()}, default=str)}
+
+Rules:
+- Use VARCHAR(500) for text fields
+- Use INT for integer numbers
+- Use FLOAT for decimal numbers
+- Always add id INT AUTO_INCREMENT PRIMARY KEY as the first column
+- Keep it simple, no foreign keys
+- Return ONLY the CREATE TABLE SQL, no explanation
+
+```sql
+CREATE TABLE ...
+```
+"""
+                step4_reply = ask_groq(model2, step4_prompt)
+                create_sql = extract_sql_block(step4_reply)
+                # Drop old table with same name and recreate fresh
+                create_sql = create_sql.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
+                create_sql = create_sql.replace("CREATE TABLE", "CREATE TABLE", 1)
+
+            # ── Step 5: Drop + Create table in TiDB ───────────────────────────────
+            with st.spinner("🛠️ Creating table in TiDB…"):
+                try:
+                    cursor = tidb_conn.cursor()
+                    cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                    tidb_conn.commit()
+                    cursor.execute(create_sql)
+                    tidb_conn.commit()
+                except Exception as e:
+                    st.error(f"❌ Table creation failed: {e}")
+                    st.stop()
+
+            st.info(f"✅ Table `{table_name}` ready in TiDB")
+
+            # ── Step 6: Insert data into TiDB ─────────────────────────────────────
+            with st.spinner("📤 Inserting data into TiDB…"):
+                try:
+                    cursor = tidb_conn.cursor()
+                    cursor.execute(f"DESCRIBE {table_name}")
+                    db_columns = [row[0] for row in cursor.fetchall() if row[0] != "id"]
+                    insert_cols = [c for c in db_columns if c in df.columns]
+                    insert_df = df[insert_cols]
+                    placeholders = ", ".join(["%s"] * len(insert_cols))
+                    col_names = ", ".join(insert_cols)
+                    insert_sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
+                    rows_inserted = 0
+                    for _, row in insert_df.iterrows():
+                        vals = tuple(None if pd.isna(v) else v for v in row.values)
+                        try:
+                            cursor.execute(insert_sql, vals)
+                            rows_inserted += 1
+                        except Exception:
+                            continue
+                    tidb_conn.commit()
+                except Exception as e:
+                    st.error(f"❌ Data insertion failed: {e}")
+                    st.stop()
+
+            # ── Step 7: Run SELECT and show results ───────────────────────────────
+            with st.spinner("🔍 Running SELECT query…"):
+                select_sql = f"SELECT * FROM {table_name} LIMIT 20"
+                cursor.execute(select_sql)
+                rows = cursor.fetchall()
+                col_names_out = [desc[0] for desc in cursor.description]
+                result_df = pd.DataFrame(rows, columns=col_names_out)
+
+            # ── Display Output ────────────────────────────────────────────────────
+            st.markdown("---")
+            st.success("✅ Successfully captured data from MongoDB and stored into MySQL")
+            st.markdown(f"**Rows Inserted:** {rows_inserted}")
+            st.markdown(f"**SELECT Query:** `{select_sql}`")
+            st.markdown("**Sample Output:**")
+            st.dataframe(result_df, use_container_width=True)
